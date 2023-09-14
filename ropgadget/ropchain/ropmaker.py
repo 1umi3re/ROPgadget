@@ -8,17 +8,19 @@
 
 from capstone import *
 
-from ropgadget.ropchain.arch.ropmakerx64 import *
-from ropgadget.ropchain.arch.ropmakerx86 import *
+from ROPgadget.ropgadget.ropchain.arch.ropmakerx64 import *
+from ROPgadget.ropgadget.ropchain.arch.ropmakerx86 import *
 
 
 class ROPMaker(object):
-    def __init__(self, binary, gadgets, offset):
+    def __init__(self, binary, gadgets, offset, rawoutput=False):
         self.__binary  = binary
         self.__gadgets = gadgets
         self.__offset  = offset
+        self.__rawoutput = rawoutput
 
-        self.__handlerArch()
+        if not self.__rawoutput:
+            self.__handlerArch()
 
     def __handlerArch(self):
 
@@ -38,3 +40,27 @@ class ROPMaker(object):
 
         else:
             print("\n[Error] ROPMaker.__handlerArch - Arch not supported yet for the rop chain generation")
+
+    def build(self):
+        result = None
+
+        if (
+            self.__binary.getArch() == CS_ARCH_X86
+            and self.__binary.getArchMode() == CS_MODE_32
+            and self.__binary.getFormat() == "ELF"
+        ):
+            maker = ROPMakerX86(self.__binary, self.__gadgets, self.__offset, self.__rawoutput)
+            result = maker.generate()
+
+        elif (
+            self.__binary.getArch() == CS_ARCH_X86
+            and self.__binary.getArchMode() == CS_MODE_64
+            and self.__binary.getFormat() == "ELF"
+        ):
+            maker = ROPMakerX64(self.__binary, self.__gadgets, self.__offset, self.__rawoutput)
+            result = maker.generate()
+
+        else:
+            print("\n[Error] ROPMaker.__handlerArch - Arch not supported yet for the rop chain generation")
+
+        return result
